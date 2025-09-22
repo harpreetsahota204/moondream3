@@ -428,8 +428,8 @@ class IsaacModel(SamplesMixin, Model):
             try:
                 # Get coordinates from point_2d field and convert to float
                 x, y = point["point_2d"]
-                x = float(x.cpu() if torch.is_tensor(x) else x)
-                y = float(y.cpu() if torch.is_tensor(y) else y)
+                x = float(x)
+                y = float(x)
                 
                 # Model outputs coordinates in 0-1000 range, normalize to 0-1
                 normalized_point = [
