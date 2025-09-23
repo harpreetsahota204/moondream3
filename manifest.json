@@ -16,9 +16,9 @@
                 "VLM",
                 "zero-shot"
             ],
-            "date_added": "2025-03-28",
+            "date_added": "2025-09-23",
             "requirements": {
-                "packages": ["huggingface-hub","transformers", "torch", "torchvision", "einops", "bitsandbytes"],
+                "packages": ["huggingface-hub","transformers", "torch", "torchvision"],
                 "cpu": {
                     "support": true
                 },
