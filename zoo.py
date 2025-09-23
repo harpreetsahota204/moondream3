@@ -1,224 +1,144 @@
-
-import os
 import logging
-import json
-from PIL import Image
-from typing import Dict, Any, List, Union, Optional
+import os
+from typing import List, Dict, Any, Optional, Union, Tuple
 
 import numpy as np
 import torch
+from PIL import Image
 
-import fiftyone as fo
+
 from fiftyone import Model, SamplesMixin
-
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-
+from fiftyone.core.labels import Detection, Detections, Keypoint, Keypoints, Classification, Classifications
+from transformers import AutoModelForCausalLM
 from transformers.utils.import_utils import is_flash_attn_2_available
 
-from .modular_isaac import IsaacProcessor
+MOONDREAM_OPERATIONS = {
+    "caption": {
+        "params": {"length": ["short", "normal", "long"]},
+    },
+    "query": {
+        "params": {},
+    },
+    "detect": {
+        "params": {},
+    },
+    "point": {
+        "params": {},
+    },
+    "classify": {
+        "params": {},
+    }
+}
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DETECTION_SYSTEM_PROMPT = """You are a helpful assistant. You specialize in detecting and localizating meaningful visual elements. 
-
-You can detect and localize objects, components, people, places, things, and UI elements in images using 2D bound boxes.
-
-Always return your response as valid JSON wrapped in ```json blocks.
-
-```json
-{
-    "detections": [
-        {
-            "bbox_2d": [x1, y1, x2, y2],
-            "label": "descriptive label for the bounding box"
-        }
-    ]
-}
-```
-
-The JSON should contain bounding boxes in pixel coordinates [x1,y1,x2,y2] format, where:
-- x1,y1 is the top-left corner
-- x2,y2 is the bottom-right corner
-- Provide specific, descriptive labels for each detected element
-- Include all relevant elements that match the user's request
-- For UI elements, include their function when possible (e.g., "Login Button" rather than just "Button")
-- If many similar elements exist, prioritize the most prominent or relevant ones
-
-The user might give you a single word instruction, a query, a list of objects, or more complex instructions. Adhere to the user's instructions and detect.
-
-<hint>BOX</hint>
-"""
-
-
-DEFAULT_CLASSIFICATION_SYSTEM_PROMPT = """You are a helpful assistant. You specializes in comprehensive classification across any visual domain, capable of analyzing:
-
-Unless specifically requested for single-class output, multiple relevant classifications can be provided.
-
-Always return your response as valid JSON wrapped in ```json blocks.
-
-```json
-{
-    "classifications": [
-        {
-            "label": "descriptive class label",
-        }
-    ]
-}
-```
-
-The JSON should contain a list of classifications where:
-- Each classification must have a 'label' field
-- Labels should be descriptive strings describing what you've identified in the image, but limited to one or two word responses
-- The response should be a list of classifications
-"""
-
-DEFAULT_KEYPOINT_SYSTEM_PROMPT = """You are a helpful assistant. You specialize in key point detection across any visual domain. A key point represents the center of any meaningful visual element. 
-
-Key points should adapt to the context (physical world, digital interfaces, UI elements, etc.) while maintaining consistent accuracy and relevance. 
-
-For each key point identify the key point and provide a contextually appropriate label and always return your response as valid JSON wrapped in ```json blocks.
-
-```json
-{
-    "keypoints": [
-        {
-            "point_2d": [x, y],
-            "label": "descriptive label for the point"
-        }
-    ]
-}
-```
-
-The JSON should contain points in pixel coordinates [x,y] format, where:
-- x is the horizontal center coordinate of the visual element
-- y is the vertical center coordinate of the visual element
-- Include all relevant elements that match the user's request
-- You can point to multiple visual elements
-
-The user might give you a single word instruction, a query, a list of objects, or more complex instructions. Adhere to the user's instructions and point.
-
-<hint>POINT</hint>
-"""
-
-DEFAULT_OCR_DETECTION_SYSTEM_PROMPT = """You are a helpful assistant specializing in text detection and recognition (OCR) in images. Your can read, detect, and locate text from any visual content, including documents, UI elements, signs, or any other text-containing regions.
-
-Always return your response as valid JSON wrapped in ```json blocks.
-
-```json
-{
-    "text_detections": [
-        {
-            "bbox_2d": [x1, y1, x2, y2],
-            "text": "Exact text content found in this region"  // Transcribe text exactly as it appears
-        }
-    ]
-}
-```
-
-The JSON should contain bounding boxes in pixel coordinates [x1,y1,x2,y2] format, where:
-- x1,y1 is the top-left corner
-- x2,y2 is the bottom-right corner
-- The 'text' field should be a string containing the exact text content found in the region
-
-The user might give you a single word instruction, a query, a list of objects, or more complex instructions. Adhere to the user's perform the OCR detections.
-
-<hint>BOX</hint>
-"""
-
-DEFAULT_OCR_SYSTEM_PROMPT = """You are an OCR assistant. Your task is to identify and extract all visible text from the image provided. Preserve the original formatting as closely as possible, including:
-
-- Line breaks and paragraphs  
-- Headings and subheadings  
-- Any tables, lists, bullet points, or numbered items  
-- Special characters, spacing, and alignment  
-
-Output strictly the extracted text in Markdown format, reflecting the layout and structure of the original image. Do not add commentary, interpretation, or summarization—only return the raw text content with its formatting.
-
-Respond with 'No Text' if there is no text in the provided image.
-"""
-
-DEFAULT_VQA_SYSTEM_PROMPT = "You are a helpful assistant. You provide clear and concise answerss to questions about images. Report answers in natural language text in English."
-
-OPERATIONS = {
-    "detect": DEFAULT_DETECTION_SYSTEM_PROMPT,
-    "point": DEFAULT_KEYPOINT_SYSTEM_PROMPT,
-    "ocr_detection": DEFAULT_OCR_DETECTION_SYSTEM_PROMPT,
-    "classify": DEFAULT_CLASSIFICATION_SYSTEM_PROMPT,
-    "ocr": DEFAULT_OCR_SYSTEM_PROMPT,
-    "vqa": DEFAULT_VQA_SYSTEM_PROMPT
-}
-
+# Utility functions
 def get_device():
+    """Get the appropriate device for model inference."""
     if torch.cuda.is_available():
         return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
 
-class IsaacModel(SamplesMixin, Model):
-    """A FiftyOne model for running Isaac 0.1 vision tasks"""
+class Moondream3(SamplesMixin, Model):
+    """A FiftyOne model for running the Moondream2 model on images.
+    
+    Args:
+        model_path (str): Path to model or HuggingFace model name
+        operation (str, optional): Type of operation to perform
+        prompt (str, optional): Prompt text to use
+        **kwargs: Additional parameters
+    """
 
     def __init__(
-        self,
+        self, 
         model_path: str,
         operation: str = None,
         prompt: str = None,
-        system_prompt: str = None,
         **kwargs
     ):
+        if not model_path:
+            raise ValueError("model_path is required")
+            
+        self.model_path = model_path
+        self._operation = None
+        self._prompt = prompt
+        self.params = {}
         self._fields = {}
         
-        self.model_path = model_path
-        self._custom_system_prompt = system_prompt  # Store custom system prompt if provided
-        self._operation = operation
-        self.prompt = prompt
         
+        # Set operation if provided
+        if operation:
+            self.operation = operation
+            
+        # Store any additional parameters
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+               
+        # Set device
         self.device = get_device()
         logger.info(f"Using device: {self.device}")
 
-        model_kwargs = {
-            "device_map": self.device,
-        }
+        logger.info(f"Loading model from local path: {model_path}")
 
-        # Set optimizations based on CUDA device capabilities
+        print("\n" + "="*80)
+        print("NOTICE: Creating necessary symbolic links for custom model code")
+        print("When loading Moondream2 from a local directory,")
+        print("the Transformers library expects to find Python modules in:")
+        print(f"  ~/.cache/huggingface/modules/transformers_modules/moondream2/")
+        print("rather than in your downloaded model directory.")
+        print("Creating symbolic links to connect these locations...")
+        print("="*80 + "\n")
+
+        cache_dir = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules/moondream2")
+
+        os.makedirs(cache_dir, exist_ok=True)
+        # Find all Python files in the model directory and create symlinks
+        for file in os.listdir(model_path):
+            if file.endswith('.py'):
+                src = os.path.join(model_path, file)
+                dst = os.path.join(cache_dir, file)
+                # Create a symlink instead of copying
+                if not os.path.exists(dst):
+                    print(f"Creating symlink for {file}")
+                    os.symlink(src, dst)
+
+            model_kwargs = {
+                "trust_remote_code": True,
+                "local_files_only": True,
+            }
+
+        # Try bfloat16 on capable CUDA devices, otherwise use float16
         if self.device == "cuda" and torch.cuda.is_available():
-            capability = torch.cuda.get_device_capability(self.device)
+            capability = torch.cuda.get_device_capability(0)
             
-            # Enable flash attention if available, otherwise use sdpa
-            model_kwargs["attn_implementation"] = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+            # Use bfloat16 on Ampere+ GPUs (SM 8.0+), float16 on older GPUs
+            if capability[0] >= 8:
+                model_kwargs["torch_dtype"] = torch.bfloat16
+                logger.info("Using bfloat16 on Ampere+ GPU")
+            else:
+                model_kwargs["torch_dtype"] = torch.float16
+                logger.info("Using float16 on pre-Ampere GPU")
+                
+            model_kwargs["device_map"] = self.device
             
-            # Enable bfloat16 on Ampere+ GPUs (compute capability 8.0+), otherwise use float16
-            model_kwargs["torch_dtype"] = torch.bfloat16 if capability[0] >= 8 else torch.float16
-
-        # Load model and processor
-        logger.info(f"Loading model from {model_path}")
-
+            # Enable flash attention if available
+            if is_flash_attn_2_available():
+                model_kwargs["attn_implementation"] = "flash_attention_2"
+        
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
+            model_path, 
+            revision=kwargs.get("revision"),
             **model_kwargs
         )
-        
+
         self.model.eval()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, 
-            trust_remote_code=True, 
-            use_fast=False
-            )
-        
-        self.config = AutoConfig.from_pretrained(
-            model_path,
-            trust_remote_code=True
-            )
-
-        logger.info("Loading processor")
-
-        self.processor = IsaacProcessor.from_pretrained(
-            tokenizer=self.tokenizer,
-            config=self.config
-        )
-
+    @property
+    def media_type(self):
+        return "image"
+    
     @property
     def needs_fields(self):
         """A dict mapping model-specific keys to sample field names."""
@@ -227,228 +147,228 @@ class IsaacModel(SamplesMixin, Model):
     @needs_fields.setter
     def needs_fields(self, fields):
         self._fields = fields
-    
+
     def _get_field(self):
+        """Get the field name to use for prompt extraction."""
         if "prompt_field" in self.needs_fields:
             prompt_field = self.needs_fields["prompt_field"]
         else:
             prompt_field = next(iter(self.needs_fields.values()), None)
-
         return prompt_field
 
     @property
-    def media_type(self):
-        return "image"
-    
-
-    @property
     def operation(self):
+        """Get the current operation."""
         return self._operation
 
     @operation.setter
     def operation(self, value):
-        if value not in OPERATIONS:
-            raise ValueError(f"Invalid operation: {value}. Must be one of {list(OPERATIONS.keys())}")
+        """Set the operation with validation."""
+        if value not in MOONDREAM_OPERATIONS:
+            raise ValueError(f"Invalid operation: {value}. Must be one of {list(MOONDREAM_OPERATIONS.keys())}")
         self._operation = value
 
     @property
-    def system_prompt(self):
-        # Return custom system prompt if set, otherwise return default for current operation
-        return self._custom_system_prompt if self._custom_system_prompt is not None else OPERATIONS[self.operation]
+    def prompt(self):
+        """Get the current prompt text."""
+        return self._prompt
 
-    @system_prompt.setter
-    def system_prompt(self, value):
-        self._custom_system_prompt = value
+    @prompt.setter
+    def prompt(self, value):
+        """Set the prompt text."""
+        self._prompt = value
+        
+    @property
+    def length(self):
+        """Get the caption length."""
+        return self.params.get("length", "normal")
 
-    def _parse_json(self, s: str) -> Optional[Dict]:
-        """Parse JSON from model output.
-        
-        The model may return JSON in different formats:
-        1. Raw JSON string
-        2. JSON wrapped in markdown code blocks (```json ... ```)
-        3. Non-JSON string (returns None)
-        
-        Args:
-            s: String output from the model to parse
-            
-        Returns:
-            Dict: Parsed JSON dictionary if successful
-            None: If parsing fails or input is invalid
-            Original input: If input is not a string
-        """
-        # Return input directly if not a string
-        if not isinstance(s, str):
-            return s
-            
-        # Handle JSON wrapped in markdown code blocks
-        if "```json" in s:
-            try:
-                # Extract JSON between ```json and ``` markers
-                s = s.split("```json")[1].split("```")[0].strip()
-            except:
-                pass
-        
-        # Attempt to parse the JSON string
-        try:
-            return json.loads(s)
-        except:
-            # Log first 200 chars of failed parse for debugging
-            logger.debug(f"Failed to parse JSON: {s[:200]}")
-            return None
+    @length.setter
+    def length(self, value):
+        """Set the caption length with validation."""
+        valid_lengths = MOONDREAM_OPERATIONS["caption"]["params"]["length"]
+        if value not in valid_lengths:
+            raise ValueError(f"Invalid length: {value}. Must be one of {valid_lengths}")
+        self.params["length"] = value
 
-    def _to_detections(self, boxes: List[Dict], image_width: int, image_height: int) -> fo.Detections:
-        """Convert bounding boxes to FiftyOne Detections.
+
+    def _convert_to_detections(self, boxes: List[Dict[str, float]], label: str) -> Detections:
+        """Convert Moondream2 detection output to FiftyOne Detections.
         
         Args:
-            boxes: List of dictionaries containing bounding box info.
-                Each box should have:
-                - 'bbox_2d' or 'bbox': List of [x1,y1,x2,y2] coordinates in 0-1000 range from model
-                - 'label': Optional string label (defaults to "object")
-            image_width: Width of the image in pixels
-            image_height: Height of the image in pixels
-
-        Returns:
-            fo.Detections object containing the converted bounding box annotations
-            with coordinates normalized to [0,1] x [0,1] range
-        """
-        if not boxes:
-            return fo.Detections(detections=[])
+            boxes: List of bounding box dictionaries
+            label: Object type label
             
+        Returns:
+            FiftyOne Detections object
+        """
         detections = []
-        
-        for box in boxes:
-            try:
-                # Try to get bbox from either bbox_2d or bbox field
-                bbox = box.get('bbox_2d', box.get('bbox', None))
-                if not bbox:
-                    continue
-                    
-                # Model outputs coordinates in 0-1000 range, normalize to 0-1
-                x1, y1, x2, y2 = map(float, bbox)
-                x = x1 / 1000.0  # Normalized left x
-                y = y1 / 1000.0  # Normalized top y
-                w = (x2 - x1) / 1000.0  # Normalized width
-                h = (y2 - y1) / 1000.0  # Normalized height
-                
-                # Create Detection object with normalized coordinates
-                try:
-                    detection = fo.Detection(
-                        label=str(box.get("label", "object")),
-                        bounding_box=[x, y, w, h],
-                    )
-                    detections.append(detection)
-                except:
-                    continue
-                
-            except Exception as e:
-                # Log any errors processing individual boxes but continue
-                logger.debug(f"Error processing box {box}: {e}")
-                continue
-                
-        return fo.Detections(detections=detections)
 
-    def _to_ocr_detections(
-        self, 
-        boxes: List[Dict], 
-        image_width: int, 
-        image_height: int
-    ) -> fo.Detections:
-        """Convert OCR results to FiftyOne Detections with text content.
-        
-        Args:
-            boxes: List of OCR dictionaries
-            image_width: Width of the original image in pixels
-            image_height: Height of the original image in pixels
-            
-        Returns:
-            fo.Detections object containing the OCR annotations with text content
-        """
-        if not boxes:
-            return fo.Detections(detections=[])
-            
-        detections = []
-        
-        # Process each OCR box
         for box in boxes:
-            try:
-                # Extract the bounding box coordinates and text content
-                bbox = box.get('bbox_2d', box.get('bbox', None))
-                text = box.get('text')  # The actual text string
-                
-                # Skip if missing required bbox or text fields
-                if not bbox or not text:
-                    continue
-                
-                # Model outputs coordinates in 0-1000 range, normalize to 0-1
-                x1, y1, x2, y2 = map(float, bbox)
-                
-                # Convert to FiftyOne format: [x, y, width, height]
-                x = x1 / 1000.0  # Left coordinate (normalized)
-                y = y1 / 1000.0  # Top coordinate (normalized)
-                w = (x2 - x1) / 1000.0  # Width (normalized)
-                h = (y2 - y1) / 1000.0  # Height (normalized)
-                
-                # Create Detection object with normalized coordinates
-                detection = fo.Detection(
-                    label="text",
-                    bounding_box=[x, y, w, h],
-                    text=str(text),
-                )
-                detections.append(detection)
-                
-            except Exception as e:
-                # Log any errors processing individual boxes but continue
-                logger.debug(f"Error processing OCR box {box}: {e}")
-                continue
-                
-        # Return all detections wrapped in a FiftyOne Detections container
-        return fo.Detections(detections=detections)
-
-    def _to_keypoints(self, points: List[Dict], image_width: int, image_height: int) -> fo.Keypoints:
-        """Convert a list of point dictionaries to FiftyOne Keypoints.
-        
-        Args:
-            points: List of dictionaries containing point information.
-                Each point should have:
-                - 'point_2d': List of [x,y] coordinates in 0-1000 range from model
-                - 'label': String label describing the point
-            image_width: Width of the image in pixels
-            image_height: Height of the image in pixels
-                
-        Returns:
-            fo.Keypoints object containing the converted keypoint annotations
-            with coordinates normalized to [0,1] x [0,1] range
-        """
-        if not points:
-            return fo.Keypoints(keypoints=[])
-            
-        keypoints = []
-        
-        for point in points:
-            try:
-                # Get coordinates from point_2d field and convert to float
-                x, y = point["point_2d"]
-                x = float(x)
-                y = float(x)
-                
-                # Model outputs coordinates in 0-1000 range, normalize to 0-1
-                normalized_point = [
-                    x / 1000.0,
-                    y / 1000.0
+            detection = Detection(
+                label=label,
+                bounding_box=[
+                    box["x_min"],
+                    box["y_min"],
+                    box["x_max"] - box["x_min"],  # width
+                    box["y_max"] - box["y_min"]   # height
                 ]
-                
-                keypoint = fo.Keypoint(
-                    label=str(point.get("label", "point")),
-                    points=[normalized_point],
-                )
-                keypoints.append(keypoint)
-            except Exception as e:
-                logger.debug(f"Error processing point {point}: {e}")
-                continue
-                
-        return fo.Keypoints(keypoints=keypoints)
+            )
 
-    def _to_classifications(self, classes: List[Dict]) -> fo.Classifications:
+            detections.append(detection)
+        
+        return Detections(detections=detections)
+
+    def _convert_to_keypoints(self, points: List[Dict[str, float]], label: str) -> Keypoints:
+        """Convert Moondream2 point output to FiftyOne Keypoints.
+        
+        Args:
+            points: List of point dictionaries
+            label: Object type label
+            
+        Returns:
+            FiftyOne Keypoints object
+        """
+        keypoints = []
+
+        for idx, point in enumerate(points):
+
+            keypoint = Keypoint(
+                label=f"{label}",
+                points=[[point["x"], point["y"]]]
+            )
+
+            keypoints.append(keypoint)
+        
+        return Keypoints(keypoints=keypoints)
+
+    def _predict_caption(self, image: Image.Image, sample=None) -> Dict[str, str]:
+        """Generate a caption for an image.
+        
+        Args:
+            image: PIL image
+            sample: Optional FiftyOne sample
+            
+        Returns:
+            dict: Caption result
+        """
+        length = self.params.get("length", "normal")
+        with torch.no_grad():
+            result = self.model.caption(image, length=length)["caption"]
+
+        return result.strip()
+
+    def _predict_query(self, image: Image.Image, sample=None) -> Dict[str, str]:
+        """Answer a visual query about an image.
+        
+        Args:
+            image: PIL image
+            sample: Optional FiftyOne sample
+            
+        Returns:
+            dict: Query answer
+        """
+        if not self.prompt:
+            raise ValueError("No prompt provided for query operation")
+
+        with torch.no_grad():    
+            result = self.model.query(image, self.prompt)["answer"]
+
+        return result.strip()
+
+    def _predict_detect(self, image: Image.Image, sample=None) -> Detections:
+        """Detect objects in an image with multiple class support.
+        
+        Args:
+            image: PIL image
+            sample: Optional FiftyOne sample
+            
+        Returns:
+            FiftyOne Detections object containing all detected objects
+        """
+        if not self.prompt:
+            raise ValueError("No prompt provided for detect operation")
+        
+        # Handle different types of prompt inputs (list or string)
+        if isinstance(self.prompt, list):
+            # If prompt is already a list, use it directly
+            classes_to_find = self.prompt
+            logger.info(f"Using list of classes: {classes_to_find}")
+        else:
+            # If prompt is a string, split it by commas and clean up whitespace
+            classes_to_find = [cls.strip() for cls in self.prompt.split(',')]
+            logger.info(f"Parsed classes from string: {classes_to_find}")
+        
+        # Initialize an empty list to store all detections across all classes
+        all_detections = []
+        
+        # Process each class separately since Moondream2 only supports one class at a time
+        for cls in classes_to_find:
+            logger.info(f"Detecting class: {cls}")
+            
+            # Call the Moondream2 model to detect objects of this specific class
+            with torch.no_grad():
+                result = self.model.detect(image, cls)["objects"]
+            logger.info(f"Found {len(result)} instances of '{cls}'")
+            
+            # Convert the detected objects to FiftyOne Detection format using our helper method
+            # This returns a Detections object for the current class
+            class_detections = self._convert_to_detections(result, cls)
+            
+            # Add all detections from this class to our combined list
+            all_detections.extend(class_detections.detections)
+        
+        # Return all detections combined in a single FiftyOne Detections object
+        logger.info(f"Total objects detected across all classes: {len(all_detections)}")
+        return Detections(detections=all_detections)
+
+    def _predict_point(self, image: Image.Image, sample=None) -> Keypoints:
+        """Identify point locations of objects in an image with multiple class support.
+        
+        Args:
+            image: PIL image
+            sample: Optional FiftyOne sample
+            
+        Returns:
+            FiftyOne Keypoints object containing all detected keypoints
+        """
+        if not self.prompt:
+            raise ValueError("No prompt provided for point operation")
+        
+        # Handle different types of prompt inputs (list or string)
+        if isinstance(self.prompt, list):
+            # If prompt is already a list, use it directly
+            classes_to_find = self.prompt
+            logger.info(f"Using list of classes: {classes_to_find}")
+        else:
+            # If prompt is a string, split it by commas and clean up whitespace
+            classes_to_find = [cls.strip() for cls in self.prompt.split(',')]
+            logger.info(f"Parsed classes from string: {classes_to_find}")
+        
+        # Initialize an empty list to store all keypoints across all classes
+        all_keypoints = []
+        
+        # Process each class separately since Moondream2 only supports one class at a time
+        for cls in classes_to_find:
+            logger.info(f"Finding points for class: {cls}")
+            
+            # Call the Moondream2 model to find points for this specific class
+            with torch.no_grad():
+                result = self.model.point(image, cls)["points"]
+            logger.info(f"Found {len(result)} points for '{cls}'")
+            
+            # Convert the detected points to FiftyOne Keypoint format using our helper method
+            # This returns a Keypoints object for the current class
+            class_keypoints = self._convert_to_keypoints(result, cls)
+            
+            # Add all keypoints from this class to our combined list
+            all_keypoints.extend(class_keypoints.keypoints)
+        
+        # Return all keypoints combined in a single FiftyOne Keypoints object
+        logger.info(f"Total points detected across all classes: {len(all_keypoints)}")
+        return Keypoints(keypoints=all_keypoints)
+        
+    def _to_classifications(self, classes: str) -> Classifications:
         """Convert a list of classification dictionaries to FiftyOne Classifications.
         
         Args:
@@ -457,140 +377,94 @@ class IsaacModel(SamplesMixin, Model):
                 - 'label': String class label
                 
         Returns:
-            fo.Classifications object containing the converted classification 
-            annotations with labels
+            fo.Classifications object containing the converted classification annotations
         """
-        if not classes:
-            return fo.Classifications(classifications=[])
-            
-        classifications = []
-        
-        # Process each classification dictionary
-        for cls in classes:
-            try:
-                # Create Classification object with required label and optional confidence
-                classification = fo.Classification(
-                    label=str(cls["label"]),  # Convert label to string for consistency
+        classification = Classification(
+                    label=classes,
                 )
-                classifications.append(classification)
-            except Exception as e:
-                # Log any errors but continue processing remaining classifications
-                logger.debug(f"Error processing classification {cls}: {e}")
-                continue
-                
-        # Return Classifications container with all processed results
-        return fo.Classifications(classifications=classifications)
+        return Classifications(classifications=[classification])
+    
 
-    def _predict(self, image: Image.Image, sample=None) -> Union[fo.Detections, fo.Keypoints, fo.Classifications, str]:
-        """Process a single image through the model and return predictions.
-        
-        This internal method handles the core prediction logic including:
-        - Constructing the chat messages with system prompt and user query
-        - Processing the image and text through the model
-        - Parsing the output based on the operation type (detection/points/classification/VQA)
+    def _predict_classify(self, image: Image.Image, sample=None) -> Classifications:
+        """Classify an image based on the prompt.
         
         Args:
-            image: PIL Image to process
-            sample: Optional FiftyOne sample containing the image filepath
+            image: PIL image
+            sample: Optional FiftyOne sample
             
         Returns:
-            One of:
-            - fo.Detections: For object detection results
-            - fo.Keypoints: For keypoint detection results  
-            - fo.Classifications: For classification results
-            - str: For VQA text responses
-            
-        Raises:
-            ValueError: If no prompt has been set
+            fo.Classifications: Classification results
         """
-        # Use local prompt variable instead of modifying self.prompt
-        prompt = self.prompt  # Start with instance default
+        # Check if a classification prompt was provided
+        if not self.prompt:
+            raise ValueError("No prompt provided for classify operation")
         
+        # Handle different types of prompt inputs (list or string)
+        if isinstance(self.prompt, list):
+            # If prompt is a list of classes, format it as a special classification prompt
+            classes_list = ", ".join(self.prompt)  # Join classes with commas for display
+            classification_prompt = f"A photo of a: {classes_list}. Respond with only of the provided choices name, and nothing more."
+            logger.info(f"Using list of classes for classification: {self.prompt}")
+        else:
+            # If prompt is a string, use it directly
+            classification_prompt = f"A photo of a: {self.prompt}. Respond with only of the provided choices name, and nothing more."
+            logger.info(f"Using string prompt for classification: {self.prompt}")
+        
+        # Query the model with the image and prompt, extract and clean the response
+        logger.info(f"Sending classification prompt to model")
+        with torch.no_grad():
+            result = self.model.query(image, classification_prompt)["answer"].strip()
+        logger.info(f"Model classified image as: {result}")
+        
+        # Convert the string result to FiftyOne Classifications format
+        classifications = self._to_classifications(result)
+        
+        return classifications
+
+    def _predict(self, image: Image.Image, sample=None) -> Any:
+        """Process a single image with Moondream2.
+        
+        Args:
+            image: PIL image
+            sample: Optional FiftyOne sample
+            
+        Returns:
+            Operation results (various types depending on operation)
+        """
+        # Centralized field handling
         if sample is not None and self._get_field() is not None:
             field_value = sample.get_field(self._get_field())
             if field_value is not None:
-                prompt = str(field_value)  # Local variable, doesn't affect instance
+                self._prompt = str(field_value)
+                
+        if not self.operation:
+            raise ValueError("No operation has been set")
+                
+        prediction_methods = {
+            "caption": self._predict_caption,
+            "query": self._predict_query,
+            "detect": self._predict_detect,
+            "point": self._predict_point,
+            "classify": self._predict_classify
+        }
+        
+        predict_method = prediction_methods.get(self.operation)
 
-        # Prepare input
-        messages = [
-            {"role": "system", "type": "text", "content": self.system_prompt},
-            {"role": "user", "type": "image", "content": "<image>"},
-            {"role": "user", "type": "text", "content": prompt}
-        ]
-        images = image  # Replace with your image path
+        if predict_method is None:
+            raise ValueError(f"Unknown operation: {self.operation}")
+            
+        return predict_method(image, sample)
 
-        # Process input
-        text = self.processor.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
-            )
-
-        inputs = self.processor(
-            text=text, 
-            images=images, 
-            return_tensors="pt"
-            )
-        
-        tensor_stream = inputs["tensor_stream"].to(self.device)
-
-        # Generate response
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                tensor_stream=tensor_stream,
-                max_new_tokens=256,
-                do_sample=False,
-                pad_token_id=self.processor.tokenizer.eos_token_id,
-            )
-
-        # Decode and print output
-        output_text = self.processor.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-        if self.operation == "vqa":
-            return output_text.strip()
-        
-        elif self.operation == "ocr":
-            return output_text.strip()
-        
-        elif self.operation == "detect":
-            parsed = self._parse_json(output_text) or {}
-            data = parsed.get('detections', [])
-            input_width, input_height = image.size
-            return self._to_detections(data, input_width, input_height)
-        
-        elif self.operation == "point":
-            parsed = self._parse_json(output_text) or {}
-            data = parsed.get('keypoints', [])
-            input_width, input_height = image.size
-            return self._to_keypoints(data, input_width, input_height)
-        
-        elif self.operation == "classify":
-            parsed = self._parse_json(output_text) or {}
-            data = parsed.get('classifications', [])
-            return self._to_classifications(data)
-        
-        elif self.operation == "ocr_detection":
-            parsed = self._parse_json(output_text) or {}
-            data = parsed.get('text_detections', [])
-            input_width, input_height = image.size
-            return self._to_ocr_detections(data, input_width, input_height)
-        
-        else:
-            return None
-
-    def predict(self, image, sample=None):
-        """Process an image with the model.
-        
-        A convenience wrapper around _predict that handles numpy array inputs
-        by converting them to PIL Images first.
+    def predict(self, image: np.ndarray, sample=None) -> Dict[str, Any]:
+        """Process an image array with Moondream2.
         
         Args:
-            image: PIL Image or numpy array to process
-            sample: Optional FiftyOne sample containing the image filepath
+            image: numpy array image
+            sample: Optional FiftyOne sample
             
         Returns:
-            Model predictions in the appropriate format for the current operation
+            dict: Operation results
         """
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-        return self._predict(image, sample)
+        logger.info(f"Running {self.operation} operation")
+        pil_image = Image.fromarray(image)
+        return self._predict(pil_image, sample)
