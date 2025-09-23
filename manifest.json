@@ -1,0 +1,31 @@
+{
+    "name": "moondream3",
+    "url": "https://github.com/harpreetsahota204/moondream3",
+    "models": [
+        {
+            "base_name": "moondream/moondream3-preview",
+            "base_filename":"moondream3",
+            "author": "Moondream AI",
+            "license": "Business Source License 1.1 with an Additional Use Grant (No Third-Party Service)",
+            "source": "https://huggingface.co/moondream/moondream3-preview",
+            "description": "Moondream 3 (Preview) is an vision language model with a mixture-of-experts architecture (9B total parameters, 2B active).",
+            "tags": [
+                "detection",
+                "segmentation",
+                "ocr",
+                "VLM",
+                "zero-shot"
+            ],
+            "date_added": "2025-03-28",
+            "requirements": {
+                "packages": ["huggingface-hub","transformers", "torch", "torchvision", "einops", "bitsandbytes"],
+                "cpu": {
+                    "support": true
+                },
+                "gpu": {
+                    "support": true
+                }
+            }
+        }
+   ]
+}
