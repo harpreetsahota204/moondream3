@@ -84,14 +84,14 @@ class Moondream3(SamplesMixin, Model):
 
         print("\n" + "="*80)
         print("NOTICE: Creating necessary symbolic links for custom model code")
-        print("When loading Moondream2 from a local directory,")
+        print("When loading Moondream3 from a local directory,")
         print("the Transformers library expects to find Python modules in:")
-        print(f"  ~/.cache/huggingface/modules/transformers_modules/moondream2/")
+        print(f"  ~/.cache/huggingface/modules/transformers_modules/moondream3/")
         print("rather than in your downloaded model directory.")
         print("Creating symbolic links to connect these locations...")
         print("="*80 + "\n")
 
-        cache_dir = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules/moondream2")
+        cache_dir = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules/moondream3")
 
         os.makedirs(cache_dir, exist_ok=True)
         # Find all Python files in the model directory and create symlinks
@@ -129,10 +129,10 @@ class Moondream3(SamplesMixin, Model):
         
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, 
-            revision=kwargs.get("revision"),
             **model_kwargs
         )
 
+        self.model.compile()
         self.model.eval()
 
     @property
