@@ -123,10 +123,6 @@ class Moondream3(SamplesMixin, Model):
                 
             model_kwargs["device_map"] = self.device
             
-            # Enable flash attention if available
-            if is_flash_attn_2_available():
-                model_kwargs["attn_implementation"] = "flash_attention_2"
-        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, 
             **model_kwargs
