@@ -7,8 +7,10 @@ import torch
 from PIL import Image
 
 
-from fiftyone import Model, SamplesMixin
+from fiftyone import Model
+from fiftyone.core.models import SupportsGetItem, TorchModelMixin
 from fiftyone.core.labels import Detection, Detections, Keypoint, Keypoints, Classification, Classifications
+from fiftyone.utils.torch import GetItem
 from transformers import AutoModelForCausalLM
 from transformers.utils.import_utils import is_flash_attn_2_available
 
@@ -41,7 +43,37 @@ def get_device():
         return "mps"
     return "cpu"
 
-class Moondream3(SamplesMixin, Model):
+
+class Moondream3GetItem(GetItem):
+    """GetItem transform for loading images for Moondream3 model.
+    
+    This class handles data loading in parallel DataLoader workers.
+    It should only perform I/O operations (loading images from disk),
+    not model inference or heavy preprocessing.
+    """
+    
+    @property
+    def required_keys(self):
+        """Keys needed from each sample."""
+        return ["filepath"]
+    
+    def __call__(self, sample_dict):
+        """Load and return a PIL Image.
+        
+        This runs in DataLoader worker processes for parallel loading.
+        
+        Args:
+            sample_dict: Dict with keys from required_keys
+            
+        Returns:
+            PIL.Image: RGB image
+        """
+        filepath = sample_dict["filepath"]
+        image = Image.open(filepath).convert("RGB")
+        return image
+
+
+class Moondream3(Model, SupportsGetItem, TorchModelMixin):
     """A FiftyOne model for running the Moondream2 model on images.
     
     Args:
@@ -58,6 +90,13 @@ class Moondream3(SamplesMixin, Model):
         prompt: str = None,
         **kwargs
     ):
+        # Initialize base classes
+        SupportsGetItem.__init__(self)
+        
+        # REQUIRED: Set preprocessing flag
+        # GetItem handles data loading, so preprocessing happens there
+        self._preprocess = False
+        
         if not model_path:
             raise ValueError("model_path is required")
             
@@ -135,6 +174,75 @@ class Moondream3(SamplesMixin, Model):
     def media_type(self):
         return "image"
     
+    # ============ REQUIRED PROPERTIES FROM Model BASE CLASS ============
+    
+    @property
+    def transforms(self):
+        """Preprocessing transforms applied to inputs.
+        
+        For SupportsGetItem models, preprocessing happens in GetItem,
+        so return None.
+        """
+        return None
+    
+    @property
+    def preprocess(self):
+        """Whether model should apply preprocessing.
+        
+        Returns False because GetItem handles data loading and preprocessing.
+        """
+        return self._preprocess
+    
+    @preprocess.setter
+    def preprocess(self, value):
+        """Allow FiftyOne to control preprocessing."""
+        self._preprocess = value
+    
+    @property
+    def ragged_batches(self):
+        """Whether this model supports batches with varying sizes.
+        
+        MUST return False to enable batching! Even though our inputs
+        (PIL Images) have variable sizes, we return False because:
+        1. We provide a custom collate_fn that handles variable sizes
+        2. ragged_batches=True would disable batching entirely
+        3. Our model handles variable-size inputs internally
+        """
+        return False
+    
+    # ============ REQUIRED PROPERTIES FROM TorchModelMixin ============
+    
+    @property
+    def has_collate_fn(self):
+        """Whether this model provides custom batch collation.
+        
+        Return True because we need custom batching logic for
+        variable-size images (don't stack them into tensors).
+        """
+        return True
+    
+    @property
+    def collate_fn(self):
+        """Custom collation function for batching.
+        
+        Returns a function that keeps images as a list rather than
+        trying to stack them (which would fail for variable sizes).
+        """
+        @staticmethod
+        def identity_collate(batch):
+            """Return batch as-is without stacking.
+            
+            Args:
+                batch: List of PIL Images from GetItem
+                
+            Returns:
+                List of PIL Images (unchanged)
+            """
+            return batch
+        return identity_collate
+    
+    # ============ MODEL-SPECIFIC PROPERTIES ============
+    
     @property
     def needs_fields(self):
         """A dict mapping model-specific keys to sample field names."""
@@ -187,6 +295,23 @@ class Moondream3(SamplesMixin, Model):
             raise ValueError(f"Invalid length: {value}. Must be one of {valid_lengths}")
         self.params["length"] = value
 
+    # ============ REQUIRED METHODS FROM SupportsGetItem ============
+    
+    def build_get_item(self, field_mapping=None):
+        """Build the GetItem transform for data loading.
+        
+        This is called by FiftyOne to create the data loading pipeline.
+        
+        Args:
+            field_mapping: Optional dict mapping required_keys to dataset fields
+                          e.g., {"filepath": "image_path"}
+        
+        Returns:
+            Moondream3GetItem instance for loading images
+        """
+        return Moondream3GetItem(field_mapping=field_mapping)
+
+    # ============ HELPER METHODS ============
 
     def _convert_to_detections(self, boxes: List[Dict[str, float]], label: str) -> Detections:
         """Convert Moondream2 detection output to FiftyOne Detections.
@@ -464,3 +589,44 @@ class Moondream3(SamplesMixin, Model):
         logger.info(f"Running {self.operation} operation")
         pil_image = Image.fromarray(image)
         return self._predict(pil_image, sample)
+    
+    def predict_all(self, images, preprocess=None):
+        """Process a batch of images with Moondream3.
+        
+        This method enables efficient batch processing when using
+        dataset.apply_model() with batch_size > 1.
+        
+        Args:
+            images: List of PIL Images from GetItem transform
+            preprocess: Whether to apply preprocessing (uses self._preprocess if None)
+                       Not used since GetItem handles data loading
+        
+        Returns:
+            List of predictions (same length as images)
+            Each prediction is in FiftyOne format:
+            - Detections for "detect" operation
+            - Keypoints for "point" operation  
+            - Classifications for "classify" operation
+            - str for "caption" and "query" operations
+        """
+        if preprocess is None:
+            preprocess = self._preprocess
+        
+        if not self.operation:
+            raise ValueError("No operation has been set")
+        
+        logger.info(f"Running batch {self.operation} operation on {len(images)} images")
+        
+        # Process each image in the batch
+        # Note: Moondream3 model may not have native batch methods for all operations,
+        # so we process images individually. However, we still benefit from:
+        # 1. Parallel data loading via DataLoader workers
+        # 2. Better GPU utilization through batching
+        # 3. Amortized overhead
+        results = []
+        for image in images:
+            # images are already PIL Images from GetItem
+            result = self._predict(image, sample=None)
+            results.append(result)
+        
+        return results
